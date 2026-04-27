@@ -252,7 +252,7 @@ def select_gpt_oss_mxfp4_moe_backend(
     triton_kernels_supported = (
         has_triton_kernels()
         and device_capability is not None
-        and (9, 0) <= device_capability < (11, 0)
+        and (9, 0) <= device_capability < (12, 0)
     )
 
     # LoRA: separate experts backend path
@@ -341,7 +341,9 @@ def select_gpt_oss_mxfp4_moe_backend(
                     None,
                     activation_format,
                 )
-            if current_platform.is_device_capability_family(100):
+            if current_platform.is_device_capability_family(
+                100
+            ) or current_platform.is_device_capability_family(110):
                 return _return_or_raise(
                     Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
                     config,

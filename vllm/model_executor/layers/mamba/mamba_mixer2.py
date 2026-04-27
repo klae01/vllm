@@ -512,8 +512,10 @@ class MambaMixer2(MambaBase, PluggableLayer):
             dim=-1,
         )
 
-        # Check if running on Blackwell (SM100+) for kernel tuning
-        self.is_blackwell = current_platform.is_device_capability_family(100)
+        # Check if running on Blackwell (SM100) or Jetson Thor (SM110) for kernel tuning
+        self.is_blackwell = current_platform.is_device_capability_family(
+            100
+        ) or current_platform.is_device_capability_family(110)
 
     def forward(
         self,

@@ -63,7 +63,10 @@ class FlashInferCuteDSLBatchedExperts(mk.FusedMoEExpertsModular):
         p = current_platform
         return (
             p.is_cuda()
-            and p.is_device_capability_family(100)
+            and (
+                p.is_device_capability_family(100)
+                or p.is_device_capability_family(110)
+            )
             and has_flashinfer_cutedsl_grouped_gemm_nt_masked()
         )
 

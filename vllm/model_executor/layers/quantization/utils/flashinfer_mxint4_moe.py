@@ -27,7 +27,10 @@ def is_flashinfer_mxint4_moe_available() -> bool:
         envs.VLLM_USE_FLASHINFER_MOE_INT4
         and has_flashinfer_trtllm_fused_moe()
         and current_platform.is_cuda()
-        and current_platform.is_device_capability_family(100)
+        and (
+            current_platform.is_device_capability_family(100)
+            or current_platform.is_device_capability_family(110)
+        )
     )
 
 

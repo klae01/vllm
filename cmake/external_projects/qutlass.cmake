@@ -32,14 +32,15 @@ endif()
 message(STATUS "[QUTLASS] QuTLASS is available at ${qutlass_SOURCE_DIR}")
 
 if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
-  cuda_archs_loose_intersection(QUTLASS_ARCHS "10.0f;12.0f" "${CUDA_ARCHS}")
+  cuda_archs_loose_intersection(QUTLASS_ARCHS "10.0f;11.0f;12.0f" "${CUDA_ARCHS}")
 else()
-  cuda_archs_loose_intersection(QUTLASS_ARCHS "12.0a;12.1a;10.0a;10.3a" "${CUDA_ARCHS}")
+  cuda_archs_loose_intersection(QUTLASS_ARCHS "12.0a;12.1a;10.0a;10.3a;11.0a" "${CUDA_ARCHS}")
 endif()
 
 if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND QUTLASS_ARCHS)
 
-  if(QUTLASS_ARCHS MATCHES "10\\.(0a|3a|0f)")
+  # Thor (11.x) is binary-compatible with sm_100f kernels, so map it to TARGET_CC=100.
+  if(QUTLASS_ARCHS MATCHES "1[01]\\.(0a|3a|0f)")
     set(QUTLASS_TARGET_CC 100)
   elseif(QUTLASS_ARCHS MATCHES "12\\.[01][af]?")
     set(QUTLASS_TARGET_CC 120)
@@ -96,7 +97,7 @@ else()
       "[QUTLASS] Skipping build: CUDA 12.8 or newer is required (found ${CMAKE_CUDA_COMPILER_VERSION}).")
   else()
     message(STATUS
-      "[QUTLASS] Skipping build: no supported arch (12.0f / 10.0f) found in "
+      "[QUTLASS] Skipping build: no supported arch (12.0f / 11.0f / 10.0f) found in "
       "CUDA_ARCHS='${CUDA_ARCHS}'.")
   endif()
 endif()

@@ -104,9 +104,9 @@ def get_flashinfer_moe_backend() -> FlashinferMoeBackend:
 
     flashinfer_moe_backend = envs.VLLM_FLASHINFER_MOE_BACKEND
     if flashinfer_moe_backend in backend_map:
-        if (
-            flashinfer_moe_backend == "latency"
-            and not current_platform.is_device_capability_family(100)
+        if flashinfer_moe_backend == "latency" and not (
+            current_platform.is_device_capability_family(100)
+            or current_platform.is_device_capability_family(110)
         ):
             logger.info_once(
                 "Flashinfer TRTLLM MOE backend is only supported on "

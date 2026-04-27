@@ -98,8 +98,8 @@ class FlashInferMLASparseBackend(AttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        # FlashInfer sparse MLA targets Blackwell (SM 10.x)
-        return capability.major == 10
+        # FlashInfer sparse MLA targets Blackwell (SM 10.x) and Jetson Thor (SM 11.x)
+        return capability.major in (10, 11)
 
     @classmethod
     def supports_combination(

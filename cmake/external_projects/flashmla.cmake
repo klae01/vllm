@@ -58,10 +58,10 @@ if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.3)
 endif()
 if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
     # CUDA 12.9 has introduced "Family-Specific Architecture Features"
-    # this supports all compute_10x family
-    list(APPEND SUPPORT_ARCHS "10.0f")
+    # this supports all compute_10x family; 11.0f covers Jetson Thor.
+    list(APPEND SUPPORT_ARCHS "10.0f" "11.0f")
 elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
-    list(APPEND SUPPORT_ARCHS "10.0a")
+    list(APPEND SUPPORT_ARCHS "10.0a" "11.0a")
 endif()
 
 

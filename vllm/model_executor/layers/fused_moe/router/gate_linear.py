@@ -35,9 +35,11 @@ class GateLinear(ReplicatedLinear):
         force_fp32_compute: bool = False,
         prefix: str = "",
     ):
-        is_hopper_or_blackwell = current_platform.is_device_capability(
-            (9, 0)
-        ) or current_platform.is_device_capability_family(100)
+        is_hopper_or_blackwell = (
+            current_platform.is_device_capability((9, 0))
+            or current_platform.is_device_capability_family(100)
+            or current_platform.is_device_capability_family(110)
+        )
         can_use_specialized_kernels = (
             current_platform.is_cuda() and is_hopper_or_blackwell and not bias
         )

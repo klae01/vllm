@@ -305,10 +305,11 @@ def supports_trtllm_attention() -> bool:
     if envs.VLLM_BATCH_INVARIANT:
         return False
 
-    # Requires SM100 and NVIDIA artifactory to be accessible to download cubins
+    # Requires SM100 (or SM110/Thor) and NVIDIA artifactory to be accessible to download cubins
     return (
-        current_platform.is_device_capability_family(100) and has_nvidia_artifactory()
-    )
+        current_platform.is_device_capability_family(100)
+        or current_platform.is_device_capability_family(110)
+    ) and has_nvidia_artifactory()
 
 
 def force_use_trtllm_attention() -> bool | None:

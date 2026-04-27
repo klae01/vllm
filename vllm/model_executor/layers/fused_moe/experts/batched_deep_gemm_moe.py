@@ -323,9 +323,9 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
         """
         DeepGemm supports packed ue8m0 activation scales format in devices == sm100
         """
-        return (
-            is_deep_gemm_e8m0_used()
-            and current_platform.is_device_capability_family(100)
+        return is_deep_gemm_e8m0_used() and (
+            current_platform.is_device_capability_family(100)
+            or current_platform.is_device_capability_family(110)
         )
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:

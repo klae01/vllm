@@ -44,11 +44,14 @@ class TrtLlmBf16Experts(mk.FusedMoEExpertsMonolithic):
 
     @staticmethod
     def _supports_current_device() -> bool:
-        """Supports only Blackwell-family GPUs."""
+        """Supports Blackwell server (SM100) and Jetson Thor (SM110) GPUs."""
         p = current_platform
         return (
             p.is_cuda()
-            and p.is_device_capability_family(100)
+            and (
+                p.is_device_capability_family(100)
+                or p.is_device_capability_family(110)
+            )
             and has_flashinfer_trtllm_fused_moe()
         )
 
