@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -7,6 +8,7 @@ import numpy as np
 import torch
 
 from vllm import SamplingParams
+from vllm.logger import init_logger
 from vllm.v1.sample.logits_processor.interface import (
     BatchUpdate,
     LogitsProcessor,
@@ -17,6 +19,8 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 T = TypeVar("T")
+
+logger = init_logger(__name__)
 
 
 class MinPLogitsProcessor(LogitsProcessor):
@@ -183,23 +187,80 @@ class MinTokensLogitsProcessor(LogitsProcessor):
             -float("inf"), dtype=torch.float32, device=self.device
         )
 
+        # --- GLM force-think ------------------------------------------------
+        # Ban the reasoning-close token (</think>) for the first N generated
+        # tokens so the <think> block (prefilled by the chat template) can
+        # never close empty. Without this the model closes reasoning
+        # immediately part of the time, producing an empty reasoning span and
+        # a dropped `reasoning_content` key. Env-driven => no SamplingParams
+        # or API change, and it reuses the min-tokens masking below, so it
+        # also works under speculative decoding (MTP) via
+        # apply_with_spec_decode().
+        self.force_think_n = int(os.getenv("GLM_FORCE_THINK_MIN_TOKENS", "0"))
+        self.think_end_ids: set[int] = set()
+        if self.force_think_n > 0:
+            override = os.getenv("GLM_THINK_END_IDS", "").strip()
+            if override:
+                self.think_end_ids = {int(x) for x in override.split(",") if x.strip()}
+            else:
+                try:
+                    try:
+                        from vllm.tokenizers import get_tokenizer
+                    except ImportError:  # older vLLM layout
+                        from vllm.transformers_utils.tokenizer import get_tokenizer
+
+                    mc = vllm_config.model_config
+                    tok = get_tokenizer(
+                        mc.tokenizer,
+                        trust_remote_code=mc.trust_remote_code,
+                        revision=mc.tokenizer_revision,
+                    )
+                    enc = tok.encode("</think>", add_special_tokens=False)
+                    if enc:
+                        self.think_end_ids = {enc[0]}
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("force-think: failed to resolve </think> id: %s", e)
+            if self.think_end_ids:
+                logger.info(
+                    "force-think enabled: banning token ids %s for the first "
+                    "%d generated tokens",
+                    sorted(self.think_end_ids),
+                    self.force_think_n,
+                )
+            else:
+                logger.warning(
+                    "force-think requested (GLM_FORCE_THINK_MIN_TOKENS=%d) but no "
+                    "</think> id resolved; disabling",
+                    self.force_think_n,
+                )
+                self.force_think_n = 0
+
     def is_argmax_invariant(self) -> bool:
         """By censoring stop tokens, min-tokens can change the outcome
         of the argmax operation in greedy sampling."""
         return False
 
-    @staticmethod
-    def add_request(
-        params: SamplingParams, _: list[int] | None, output_tok_ids: list[int]
+    def _add_request(
+        self, params: SamplingParams, _: list[int] | None, output_tok_ids: list[int]
     ) -> tuple[int, Sequence[int], set[int]] | None:
-        min_tokens = params.min_tokens
-        if not min_tokens or len(output_tok_ids) >= min_tokens:
+        min_tokens = params.min_tokens or 0
+        # Fresh set: never mutate params.all_stop_token_ids.
+        stop_ids: set[int] = set(params.all_stop_token_ids)
+
+        threshold = min_tokens
+        if self.force_think_n > 0:
+            # Force >= force_think_n reasoning tokens by also inhibiting the
+            # </think> id until the threshold is reached.
+            threshold = max(threshold, self.force_think_n)
+            stop_ids |= self.think_end_ids
+
+        if threshold <= 0 or not stop_ids or len(output_tok_ids) >= threshold:
             return None
-        return min_tokens, output_tok_ids, params.all_stop_token_ids
+        return threshold, output_tok_ids, stop_ids
 
     def update_state(self, batch_update: BatchUpdate | None):
         needs_update = process_dict_updates(
-            self.min_toks, batch_update, self.add_request
+            self.min_toks, batch_update, self._add_request
         )
         if self.min_toks:
             # Check for any requests that have attained their min tokens.
