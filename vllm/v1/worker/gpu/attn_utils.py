@@ -249,7 +249,24 @@ def _reshape_attention_kv_cache(
         )
     else:
         # No padding — safe to use a contiguous view.
-        kv_cache = kv_raw_tensor.view(dtype).view(permuted_kv_cache_shape)
+        viewed = kv_raw_tensor.view(dtype)
+        if viewed.numel() != prod(permuted_kv_cache_shape):
+            # The requested shape disagrees with the allocated page size (e.g. a
+            # packed fp8_ds_mla page whose 656B/token layout was reported as the
+            # unpacked head_size 576). The buffer was allocated from
+            # kv_cache_spec.page_size_bytes, so trust it: keep the leading dims
+            # and derive the last dim from the real element count, matching what
+            # the attention kernel actually reads.
+            lead = prod(permuted_kv_cache_shape[:-1])
+            assert lead > 0 and viewed.numel() % lead == 0, (
+                f"cannot reconcile KV cache buffer of {viewed.numel()} elements "
+                f"with requested shape {permuted_kv_cache_shape}"
+            )
+            permuted_kv_cache_shape = (
+                *permuted_kv_cache_shape[:-1],
+                viewed.numel() // lead,
+            )
+        kv_cache = viewed.view(permuted_kv_cache_shape)
 
     return kv_cache.permute(*inv_order)
 
