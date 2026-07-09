@@ -551,20 +551,33 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
     ) -> torch.Tensor:
         """Normalize a decode-kernel LSE to ``[num_tokens, num_heads]`` fp32.
 
-        The FlashMLA kernel returns the LSE for a batched
-        ``(batch, seq_len, num_heads, ...)`` query as a 3-D tensor whose head
-        and sequence axes may be ordered either way depending on the kernel
-        build. The DCP combine expects ``[tokens, heads]`` (fp32), so collapse
-        the ``(batch, seq_len)`` axes into ``tokens`` regardless of layout.
+        The FP8 decode kernel pads the query heads to 64/128 and returns the
+        LSE for the *padded* head count, with the head and (batch, seq) axes
+        ordered either way depending on the kernel build. Reconcile purely from
+        the element count so no layout assumption is needed: ``heads_eff`` (the
+        padded head count) is ``numel // num_tokens``; the axis whose size is
+        ``heads_eff`` is the head axis, and every other axis is a token axis.
+        Move the head axis last, collapse the rest into ``tokens`` (preserving
+        order), then slice the padded heads back to ``num_heads`` so the DCP
+        combine sees exactly ``[tokens, heads]``.
         """
         lse = lse.to(torch.float32)
-        if lse.dim() == 2:
-            return lse.reshape(num_tokens, num_heads)
-        assert lse.dim() == 3, f"unexpected LSE rank {lse.dim()}"
-        # (batch, num_heads, seq_len) -> (batch, seq_len, num_heads)
-        if lse.shape[1] == num_heads and lse.shape[2] != num_heads:
-            lse = lse.transpose(1, 2)
-        return lse.reshape(num_tokens, num_heads)
+        total = lse.numel()
+        assert total % num_tokens == 0, (
+            f"LSE numel {total} not divisible by num_tokens {num_tokens}"
+        )
+        heads_eff = total // num_tokens
+        head_axis = next(
+            (i for i, s in enumerate(lse.shape) if s == heads_eff), None
+        )
+        assert head_axis is not None, (
+            f"no LSE axis matches padded head count {heads_eff} "
+            f"in shape {tuple(lse.shape)}"
+        )
+        lse = lse.movedim(head_axis, -1).reshape(num_tokens, heads_eff)
+        if heads_eff != num_heads:
+            lse = lse[:, :num_heads]
+        return lse.contiguous()
 
     @staticmethod
     def _compute_fp8_decode_padded_heads(num_heads: int) -> int:
