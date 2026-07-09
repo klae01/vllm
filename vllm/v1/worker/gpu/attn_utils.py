@@ -309,12 +309,24 @@ def _reshape_kv_cache(
                 # Skipped layers (--kv-cache-dtype-skip-layers) keep the
                 # unquantized shape; only the quantized primary uses the
                 # quantized cache dtype's (possibly packed) layout.
-                layer_cache_dtype = (
-                    "auto"
-                    if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
+                #
+                # MLA packed layouts (fp8_ds_mla) advertise their packed page
+                # via the spec's cache_dtype_str and leave kv_quant_mode == NONE
+                # (it is not a per-token/tensor KV quant mode). The plain
+                # kv_quant_mode gate would then pick the unpacked "auto" shape
+                # (head_size) while the page was allocated at the packed size
+                # (656B), so honour cache_dtype_str for these specs.
+                # "fp8" is the MLA alias for the packed fp8_ds_mla layout.
+                spec_cache_dtype = getattr(kv_cache_spec, "cache_dtype_str", None)
+                if spec_cache_dtype in ("fp8_ds_mla", "fp8"):
+                    layer_cache_dtype = "fp8_ds_mla"
+                elif (
+                    kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
                     and not isinstance(kv_cache_spec, TQFullAttentionSpec)
-                    else cache_dtype
-                )
+                ):
+                    layer_cache_dtype = "auto"
+                else:
+                    layer_cache_dtype = cache_dtype
                 kv_cache_shape = group.backend.get_kv_cache_shape(
                     kernel_num_blocks,
                     kernel_block_size,
