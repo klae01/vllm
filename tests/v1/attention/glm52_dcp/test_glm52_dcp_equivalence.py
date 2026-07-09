@@ -71,12 +71,13 @@ SHORT_PROMPTS = [
     "In distributed systems, consensus means",
 ]
 # > index_topk (2048) tokens so the single decode step attends over more KV than
-# the top-k budget and the indexer must pick a strict subset. ~500 short
-# sentences lands comfortably in (2048, MAX_MODEL_LEN).
+# the top-k budget and the indexer must pick a strict subset. ~200 of these
+# sentences tokenize to ~3.3k tokens -- comfortably inside (2048, MAX_MODEL_LEN);
+# each sentence is ~16 tokens, so keep the count well under MAX_MODEL_LEN/16.
 LONG_PROMPT = " ".join(
     f"Section {i}: the measurement recorded at station {i % 13} was "
     f"{(i * 7) % 97} units."
-    for i in range(500)
+    for i in range(200)
 )
 BASE_PROMPTS = [*SHORT_PROMPTS, LONG_PROMPT]
 
