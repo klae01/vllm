@@ -891,9 +891,18 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             softmax_scale=self.softmax_scale,
         )
 
-        # Slice output back to actual head count if we padded
+        # Slice output back to actual head count if we padded. The kernel emits
+        # LSE with the padded head count too, so slice it on the head axis as
+        # well; otherwise the extra padded-head LSE entries corrupt the
+        # downstream reshape and the DCP LSE-weighted combine.
         if actual_num_heads < padded_num_heads:
             out = out[:, :, :actual_num_heads, :]
+            if lse.shape[-1] == padded_num_heads:
+                # LSE laid out (..., H): heads on the last axis.
+                lse = lse[..., :actual_num_heads]
+            elif lse.dim() >= 2 and lse.shape[-2] == padded_num_heads:
+                # LSE laid out (..., H, 1) or (..., H, X): heads on axis -2.
+                lse = lse[..., :actual_num_heads, :]
 
         return out, lse
 
