@@ -17,8 +17,9 @@ Design notes
   ``(tp=8, dcp=8)``. Same TP sharding + same seed => identical dummy weights;
   DCP only reshards the KV cache. Comparing ``tp=1`` against ``tp=8`` would
   change the dummy-weight sharding and is *not* a valid DCP check.
-* Uses ``dcp_comm_backend="a2a"`` to exercise the #41160 all-to-all + LSE
-  combine path that the sparse backend now feeds via its returned ``softmax_lse``.
+* Uses ``dcp_comm_backend="ag_rs"`` (matching the production serve) to exercise
+  the all-gather + reduce-scatter LSE combine (``cp_lse_ag_out_rs``) that the
+  sparse backend now feeds via its returned ``softmax_lse``.
 
 Hardware requirements (why this may not run everywhere)
 ------------------------------------------------------
@@ -64,8 +65,14 @@ def _run(dcp: int, tp: int = 8, seed: int = 0):
         load_format="dummy",
         tensor_parallel_size=tp,
         decode_context_parallel_size=dcp,
-        dcp_comm_backend="a2a" if dcp > 1 else "ag_rs",
-        enforce_eager=False,  # keep cudagraphs to exercise UNIFORM_BATCH capture
+        # Match the production serve: AG+RS LSE combine (cp_lse_ag_out_rs).
+        dcp_comm_backend="ag_rs",
+        # Eager to match the serve config AND to avoid the compile-time
+        # fuse_allreduce_rms pass, whose FlashInfer trtllm_mnnvl_allreduce_fusion
+        # binding is arg-count-incompatible with the installed FlashInfer
+        # (unrelated to DCP; it fires during cudagraph capture, not the sparse
+        # forward). Correctness (DCP=1 vs DCP=8 logits) is unaffected by eager.
+        enforce_eager=True,
         max_model_len=4096,
         seed=seed,
         gpu_memory_utilization=0.9,
