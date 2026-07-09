@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 from math import prod
 from typing import Any, cast
 
+import os
 import torch
 
 from vllm.config import (
@@ -316,9 +317,14 @@ def _reshape_kv_cache(
                 # kv_quant_mode gate would then pick the unpacked "auto" shape
                 # (head_size) while the page was allocated at the packed size
                 # (656B), so honour cache_dtype_str for these specs.
-                # "fp8" is the MLA alias for the packed fp8_ds_mla layout.
+                # Any fp8 cache dtype on an MLA spec means the packed fp8_ds_mla
+                # layout ("fp8" is an alias); map it so the reshape matches the
+                # allocated packed page (656B/token) instead of the unpacked
+                # "auto" shape (head_size).
                 spec_cache_dtype = getattr(kv_cache_spec, "cache_dtype_str", None)
-                if spec_cache_dtype in ("fp8_ds_mla", "fp8"):
+                if isinstance(spec_cache_dtype, str) and spec_cache_dtype.startswith(
+                    "fp8"
+                ):
                     layer_cache_dtype = "fp8_ds_mla"
                 elif (
                     kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
@@ -327,6 +333,16 @@ def _reshape_kv_cache(
                     layer_cache_dtype = "auto"
                 else:
                     layer_cache_dtype = cache_dtype
+                if os.environ.get("VLLM_DEBUG_KVSHAPE"):
+                    print(
+                        f"[KVSHAPE] {layer_name} spec={type(kv_cache_spec).__name__} "
+                        f"cds={spec_cache_dtype!r} "
+                        f"kqm={kv_cache_spec.kv_quant_mode} "
+                        f"lcd={layer_cache_dtype!r} "
+                        f"psb={kv_cache_spec.page_size_bytes} "
+                        f"hs={kv_cache_spec.head_size}",
+                        flush=True,
+                    )
                 kv_cache_shape = group.backend.get_kv_cache_shape(
                     kernel_num_blocks,
                     kernel_block_size,
