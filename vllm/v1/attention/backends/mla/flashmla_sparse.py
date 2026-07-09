@@ -842,15 +842,34 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         prefill kernel which has head padding overhead when num_heads is small.
         Used when use_mixed_batch is True.
         """
-        # Convert per-request indices to global slots (decode) or workspace
-        # offsets (prefill).
-        topk_indices = triton_convert_req_index_to_global_index(
-            attn_metadata.req_id_per_token,
-            attn_metadata.block_table,
-            topk_indices,
-            BLOCK_SIZE=attn_metadata.block_size,
-            NUM_TOPK_TOKENS=topk_indices.shape[1],
-        )
+        # Convert per-request indices to global cache slots. Under DCP the KV
+        # cache is sharded across cp ranks, so the globally-consistent top-k
+        # (produced by the indexer's DCP top-k merge) must be de-interleaved to
+        # this rank's owned slots -- otherwise every rank reads KV it does not
+        # hold. This mirrors _forward_fp8_kv_separate_prefill_decode; the fp8
+        # kernel skips sentinel (invalid) indices, so the valid counts are only
+        # needed by the BF16 prefill kernel and are ignored here.
+        dcp_world_size = getattr(self, "dcp_world_size", 1)
+        if dcp_world_size > 1:
+            topk_indices, _ = triton_filter_and_convert_dcp_index(
+                attn_metadata.req_id_per_token,
+                attn_metadata.block_table,
+                topk_indices,
+                dcp_size=dcp_world_size,
+                dcp_rank=self.dcp_rank,
+                cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+                BLOCK_SIZE=attn_metadata.block_size,
+                NUM_TOPK_TOKENS=topk_indices.shape[1],
+                return_valid_counts=True,
+            )
+        else:
+            topk_indices = triton_convert_req_index_to_global_index(
+                attn_metadata.req_id_per_token,
+                attn_metadata.block_table,
+                topk_indices,
+                BLOCK_SIZE=attn_metadata.block_size,
+                NUM_TOPK_TOKENS=topk_indices.shape[1],
+            )
 
         assert attn_metadata.fp8_extra_metadata is not None
         assert isinstance(
