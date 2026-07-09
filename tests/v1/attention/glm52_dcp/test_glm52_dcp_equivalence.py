@@ -82,7 +82,8 @@ def _run(dcp: int, tp: int = 8, seed: int = 0):
         seed=seed,
         gpu_memory_utilization=0.9,
     )
-    sp = SamplingParams(temperature=0.0, max_tokens=1, logprobs=64)
+    # 20 = vLLM's default max_logprobs cap; enough top tokens for the compare.
+    sp = SamplingParams(temperature=0.0, max_tokens=1, logprobs=20)
     outs = llm.generate(PROMPTS, sp)
     result = []
     for o in outs:
