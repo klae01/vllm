@@ -65,6 +65,11 @@ def _run(dcp: int, tp: int = 8, seed: int = 0):
         load_format="dummy",
         tensor_parallel_size=tp,
         decode_context_parallel_size=dcp,
+        # Critical: fp8 KV cache -> fp8_ds_mla -> the FLASHMLA_SPARSE backend
+        # (the one the production serve uses and the one these DCP fixes touch).
+        # Without this the model picks FLASH_ATTN_MLA_SPARSE (a different backend)
+        # and the test would validate the wrong code path.
+        kv_cache_dtype="fp8",
         # Match the production serve: AG+RS LSE combine (cp_lse_ag_out_rs).
         dcp_comm_backend="ag_rs",
         # Eager to match the serve config AND to avoid the compile-time
