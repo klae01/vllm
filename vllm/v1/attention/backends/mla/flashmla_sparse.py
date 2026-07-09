@@ -868,7 +868,13 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
 
         # Output is (1, T, H, D_v), squeeze back to (T, H, D_v)
         attn_out = _attn_out.squeeze(0)
-        lse = self._reshape_lse_for_spec_decode(_lse, num_tokens, self.num_heads)
+        # Match the LSE head count to attn_out's own head count, NOT
+        # self.num_heads. Under DCP the query heads are all-gathered across cp
+        # ranks (H = num_heads * dcp_world_size) before this call, and the DCP
+        # combine needs the LSE for *all* gathered heads to reduce-scatter them
+        # back to the locally-owned heads. Passing self.num_heads here would
+        # drop the extra DCP heads and corrupt the combine.
+        lse = self._reshape_lse_for_spec_decode(_lse, num_tokens, attn_out.shape[1])
         return attn_out, lse
 
     def _fp8_flash_mla_kernel(
