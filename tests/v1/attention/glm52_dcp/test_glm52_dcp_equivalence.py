@@ -43,10 +43,7 @@ Hardware requirements (why this may not run everywhere)
 ------------------------------------------------------
 The FlashMLA sparse decode kernel is Hopper-only, and DCP needs working NCCL
 collectives (a CUDA-12.9 NCCL on a CUDA-12.8 driver fails). On non-Hopper /
-old-driver boxes this test cannot execute the sparse attention forward; the
-component correctness (LSE combine, exact distributed top-k) is validated
-hardware-independently by ``tests/v1/attention/test_dcp_lse_combine.py`` and
-``tests/v1/attention/test_dcp_exact_topk.py``.
+old-driver boxes this test cannot execute the sparse attention forward.
 
 Run::
 

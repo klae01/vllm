@@ -31,10 +31,7 @@ from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
-from vllm.v1.worker.workspace import (
-    current_workspace_manager,
-    is_workspace_manager_initialized,
-)
+from vllm.v1.worker.workspace import current_workspace_manager
 
 if is_flash_attn_varlen_func_available():
     from vllm.v1.attention.backends.fa_utils import (
@@ -375,30 +372,6 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         self.cp_kv_cache_interleave_size = (
             self.parallel_config.cp_kv_cache_interleave_size
         )
-
-        # Pre-reserve the DCP attention workspace at the worst case. The MTP
-        # drafter reuses this builder, but its warmup dummy_run runs with
-        # attn_metadata=None and therefore never exercises _forward_with_dcp;
-        # without an up-front reservation the two growable DCP buffers there are
-        # first allocated at real decode time, *after* the workspace was locked
-        # following cudagraph capture, so a still-zero/too-small buffer raises.
-        # Reserving from max_num_batched_tokens bounds both target and draft
-        # token counts. See vllm-project/vllm#40791.
-        if self.dcp_world_size > 1 and is_workspace_manager_initialized():
-            max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-            # _forward_with_dcp allocates dcp_context_out
-            # (num_heads_q * dcp_world_size heads) and, sequentially, the
-            # smaller dcp_query_out; reserving the larger covers both.
-            current_workspace_manager().get_simultaneous(
-                (
-                    (
-                        max_tokens,
-                        self.num_heads_q * self.dcp_world_size,
-                        self.headdim,
-                    ),
-                    self.model_config.dtype,
-                ),
-            )
 
         self.use_full_cuda_graph = (
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()

@@ -5,7 +5,6 @@ from dataclasses import dataclass, replace
 from math import prod
 from typing import Any, cast
 
-import os
 import torch
 
 from vllm.config import (
@@ -350,16 +349,6 @@ def _reshape_kv_cache(
                     layer_cache_dtype = "auto"
                 else:
                     layer_cache_dtype = cache_dtype
-                if os.environ.get("VLLM_DEBUG_KVSHAPE"):
-                    print(
-                        f"[KVSHAPE] {layer_name} spec={type(kv_cache_spec).__name__} "
-                        f"cds={spec_cache_dtype!r} "
-                        f"kqm={kv_cache_spec.kv_quant_mode} "
-                        f"lcd={layer_cache_dtype!r} "
-                        f"psb={kv_cache_spec.page_size_bytes} "
-                        f"hs={kv_cache_spec.head_size}",
-                        flush=True,
-                    )
                 kv_cache_shape = group.backend.get_kv_cache_shape(
                     kernel_num_blocks,
                     kernel_block_size,
