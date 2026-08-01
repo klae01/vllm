@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
@@ -63,6 +63,13 @@ logger = init_logger(__name__)
 # so when the per-rank head count is below MIN_HEADS_FOR_BF16_PREFILL we use the mixed
 # batch mode (#1).
 MIN_HEADS_FOR_BF16_PREFILL = 32
+
+# The FP8 sparse decode kernel allocates transient fp32 split-KV accumulators
+# of (b + num_sm_parts) * s_q * h_q * d_v * 4 bytes (~270 KB/token at 64
+# gathered heads). Cap s_q per invocation so a large mixed batch (e.g. the
+# memory-profiling dummy run at max_num_batched_tokens) stays bounded instead
+# of failing the alloc or inflating the activation reservation.
+FP8_DECODE_MAX_SQ = int(os.environ.get("VLLM_FLASHMLA_SPARSE_DECODE_MAX_SQ", "8192"))
 
 """
 NOTE: FlashMLA Sparse uses an fp8 cache with the following format
@@ -174,6 +181,11 @@ class FlashMLASparseMetadata(AttentionMetadata):
         scheduler_metadata: FlashMLASchedMeta
         dummy_block_table: torch.Tensor
         cache_lens: torch.Tensor
+        # Per-slice-length kernel metadata for token-sliced mixed-batch
+        # calls (FP8_DECODE_MAX_SQ); shared across layers within a step.
+        sliced_scheduler_metadata: dict[
+            int, "FlashMLASparseMetadata.FP8KernelMetadata"
+        ] = field(default_factory=dict)
 
     @dataclass
     class FP8SeparatePrefillDecode:
@@ -1205,12 +1217,45 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         fp8_metadata = attn_metadata.fp8_extra_metadata
 
         num_tokens = q.shape[0]
-        _attn_out, _lse = self._fp8_flash_mla_kernel(
-            q=q.unsqueeze(0),  # unsqueeze to add batch_dim: (T, H, D) -> (1, T, H, D)
-            kv_c_and_k_pe_cache=kv_c_and_k_pe_cache,
-            topk_indices=topk_indices.unsqueeze(0),  # (T, topk) -> (1, T, topk)
-            kernel_metadata=fp8_metadata,
-        )
+        if num_tokens > FP8_DECODE_MAX_SQ:
+            # Token-sliced calls bound the kernel's transient fp32 split-KV
+            # accumulators (~270 KB/token at 64 gathered heads). Each token
+            # attends independently via its own top-k indices, so slicing the
+            # token axis is exact. FlashMLASchedMeta locks s_q at first use, so
+            # each distinct slice length needs its own instance (reused across
+            # layers via fp8_metadata).
+            outs, lses = [], []
+            for start in range(0, num_tokens, FP8_DECODE_MAX_SQ):
+                end = min(start + FP8_DECODE_MAX_SQ, num_tokens)
+                sliced = fp8_metadata.sliced_scheduler_metadata.setdefault(
+                    end - start,
+                    FlashMLASparseMetadata.FP8KernelMetadata(
+                        scheduler_metadata=get_mla_metadata()[0],
+                        dummy_block_table=fp8_metadata.dummy_block_table,
+                        cache_lens=fp8_metadata.cache_lens,
+                    ),
+                )
+                o, l = self._fp8_flash_mla_kernel(
+                    q=q[start:end].unsqueeze(0),
+                    kv_c_and_k_pe_cache=kv_c_and_k_pe_cache,
+                    topk_indices=topk_indices[start:end].unsqueeze(0),
+                    kernel_metadata=sliced,
+                )
+                outs.append(o)
+                lses.append(l)
+            _attn_out = torch.cat(outs, dim=1)
+            # LSE layout is build-dependent ((1, H, s) or (1, s, H)); find the
+            # token axis from the first slice, whose length (FP8_DECODE_MAX_SQ)
+            # cannot collide with the head count.
+            token_axis = -1 if lses[0].shape[-1] == FP8_DECODE_MAX_SQ else -2
+            _lse = torch.cat(lses, dim=token_axis)
+        else:
+            _attn_out, _lse = self._fp8_flash_mla_kernel(
+                q=q.unsqueeze(0),  # add batch_dim: (T, H, D) -> (1, T, H, D)
+                kv_c_and_k_pe_cache=kv_c_and_k_pe_cache,
+                topk_indices=topk_indices.unsqueeze(0),  # (T, topk) -> (1, T, topk)
+                kernel_metadata=fp8_metadata,
+            )
 
         # Output is (1, T, H, D_v), squeeze back to (T, H, D_v)
         attn_out = _attn_out.squeeze(0)
