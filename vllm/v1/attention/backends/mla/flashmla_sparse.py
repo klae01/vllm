@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
+import torch.distributed as dist
 
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -665,6 +667,14 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         self.prefill_padding = (
             128 if current_platform.is_device_capability_family(100) else 64
         )
+        # DCP stripe comm: prefill rows exchange only their stripe's q/out via
+        # a 1/dcp-volume all-to-all instead of riding the whole-batch head
+        # allgather + LSE combine (escape hatch for NCCL builds where
+        # all_to_all_single is broken: set to 0 to fall back to the
+        # whole-batch allgather with the -inf masked combine).
+        self._dcp_stripe_comm = (
+            os.environ.get("VLLM_FLASHMLA_SPARSE_DCP_STRIPE_A2A", "1") == "1"
+        )
 
         vllm_config = get_current_vllm_config()
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -843,7 +853,39 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         # Pure decode: direct call without allocation
         if num_decode_tokens > 0 and num_prefill_tokens == 0:
             assert fp8_metadata.decode is not None
+            if self.dcp_self_managed_comm(attn_metadata):
+                # Decode-subset call (e.g. the MTP drafter) while the batch
+                # metadata contains prefills: the MLA common forward skipped
+                # the head allgather and will skip the combine, so both run
+                # here restricted to the decode rows.
+                from vllm.distributed.parallel_state import get_dcp_group
+                from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+
+                dcp_group = get_dcp_group()
+                q_dec = dcp_group.all_gather(q.contiguous(), dim=1)
+                attn_out, decode_lse = _fp8_decode(q_dec, topk_indices)
+                attn_out = cp_lse_ag_out_rs(
+                    attn_out,
+                    decode_lse,
+                    dcp_group,
+                    is_lse_base_on_e=self.lse_base_on_e,
+                )
+                return attn_out, None
             attn_out, decode_lse = _fp8_decode(q, topk_indices)
+        elif dcp_fast and self.dcp_self_managed_comm(attn_metadata):
+            # Self-managed DCP comm: q arrives with LOCAL heads (the MLA
+            # common forward skipped the whole-batch head allgather). Decode
+            # rows are gathered/combined here; prefill stripes exchange only
+            # their stripe's q/out via all-to-all.
+            return self._forward_fp8_dcp_stripe_comm(
+                q,
+                kv_c_and_k_pe_cache,
+                topk_indices,
+                raw_topk_indices,
+                attn_metadata,
+                fp8_metadata,
+                _fp8_decode,
+            )
         else:
             # Mixed or pure prefill: allocate output tensor. Use the runtime
             # head count: under DCP the query heads arrive all-gathered
@@ -951,6 +993,167 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             return attn_out, lse
 
         return attn_out, decode_lse
+
+    def dcp_self_managed_comm(self, attn_metadata: FlashMLASparseMetadata) -> bool:
+        """True when this impl exchanges DCP q/out itself for this batch.
+
+        Prefill stripes need only their stripe's q with all heads (a
+        1/dcp-volume all-to-all instead of the whole-batch head allgather)
+        and produce complete outputs, so only decode rows go through the
+        allgather + LSE combine. The MLA common forward skips its whole-batch
+        allgather and combine when this returns True; both sides evaluate the
+        same metadata-only predicate so they always agree.
+        """
+        if (
+            self.dcp_world_size <= 1
+            or not self._dcp_stripe_comm
+            or attn_metadata.fp8_use_mixed_batch
+        ):
+            return False
+        m = attn_metadata.fp8_extra_metadata
+        return (
+            isinstance(m, FlashMLASparseMetadata.FP8SeparatePrefillDecode)
+            and m.prefill is not None
+            and m.prefill.dcp_fast
+            and m.num_prefill_tokens > 0
+        )
+
+    def _forward_fp8_dcp_stripe_comm(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        decode_topk_indices: torch.Tensor,
+        raw_topk_indices: torch.Tensor,
+        attn_metadata: FlashMLASparseMetadata,
+        fp8_metadata: "FlashMLASparseMetadata.FP8SeparatePrefillDecode",
+        _fp8_decode,
+    ) -> tuple[torch.Tensor, None]:
+        """DCP separate-path forward with self-managed q/out exchange.
+
+        ``q`` carries LOCAL heads ([B, H_local, D]). Decode rows ride the
+        head allgather + exact LSE combine restricted to the decode prefix;
+        each prefill chunk stripes its rows across DCP ranks and exchanges
+        q/out via equal-split all-to-alls (1/dcp of the allgather volume).
+        Stripe outputs are complete (full context, all heads), so prefill
+        rows need no LSE combine. Returns local-head output, lse=None.
+        """
+        from vllm.distributed.parallel_state import get_dcp_group
+        from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+
+        logger.info_once(
+            "FlashMLA sparse: DCP stripe comm active (decode-only q allgather"
+            " + per-chunk stripe all-to-all for prefill)"
+        )
+        dcp_group = get_dcp_group()
+        dcp = self.dcp_world_size
+        num_mqa_tokens = q.shape[0]
+        num_decode_tokens = fp8_metadata.num_decode_tokens
+        heads = self.num_heads
+        head_dim = q.shape[-1]
+        out_dim = self.kv_lora_rank
+
+        attn_out = q.new_empty((num_mqa_tokens, heads, out_dim))
+
+        if num_decode_tokens > 0:
+            q_dec = dcp_group.all_gather(
+                q[:num_decode_tokens].contiguous(), dim=1
+            )
+            decode_out, decode_lse = _fp8_decode(q_dec, decode_topk_indices)
+            attn_out[:num_decode_tokens] = cp_lse_ag_out_rs(
+                decode_out,
+                decode_lse,
+                dcp_group,
+                is_lse_base_on_e=self.lse_base_on_e,
+            )
+
+        prefill_meta = fp8_metadata.prefill
+        assert prefill_meta is not None
+        for chunk in prefill_meta.chunks:
+            tot = int(chunk.chunk_tot_seqlen)
+            local_ws = self.prefill_bf16_workspace[:tot]
+            ops.cp_gather_and_upconvert_fp8_kv_cache(
+                kv_c_and_k_pe_cache,
+                local_ws,
+                chunk.block_table,
+                chunk.workspace_starts,
+                len(chunk.block_table),
+            )
+            # Collective: every rank contributes the same padded row count.
+            gathered_ws = dcp_group.all_gather(local_ws, dim=0)
+
+            token_start = chunk.tokens_slice.start
+            num_chunk_tokens = chunk.tokens_slice.stop - token_start
+            stripe_len = -(-num_chunk_tokens // dcp)
+
+            # q exchange: send[s] = this rank's local heads of stripe s's
+            # rows; recv[s] = rank s's local heads of THIS rank's stripe.
+            # Equal splits (zero-padded tail stripes); every rank
+            # participates even with an empty stripe.
+            q_chunk = q[chunk.tokens_slice]
+            send_q = q.new_zeros((dcp, stripe_len, heads, head_dim))
+            for s in range(dcp):
+                seg = q_chunk[s * stripe_len : min((s + 1) * stripe_len,
+                                                   num_chunk_tokens)]
+                if seg.shape[0] > 0:
+                    send_q[s, : seg.shape[0]] = seg
+            recv_q = torch.empty_like(send_q)
+            dist.all_to_all_single(
+                recv_q, send_q, group=dcp_group.device_group
+            )
+
+            stripe = chunk.stripe_slice
+            assert stripe is not None
+            my_rows = max(0, stripe.stop - stripe.start)
+            out_stripe = None
+            if my_rows > 0:
+                # Rank-major head order matches all_gather(dim=1).
+                q_stripe = (
+                    recv_q[:, :my_rows]
+                    .permute(1, 0, 2, 3)
+                    .reshape(my_rows, dcp * heads, head_dim)
+                )
+                ws_indices, ws_topk_length = (
+                    triton_convert_req_index_to_dcp_gathered_ws_index(
+                        prefill_meta.request_ids[stripe],
+                        raw_topk_indices[stripe],
+                        prefill_meta.workspace_starts,
+                        per_rank_rows=tot,
+                        dcp_size=dcp,
+                        cp_kv_cache_interleave_size=(
+                            attn_metadata.cp_kv_cache_interleave_size
+                        ),
+                    )
+                )
+                out_stripe = self._bf16_flash_mla_kernel(
+                    q_stripe,
+                    gathered_ws,
+                    ws_indices,
+                    ws_topk_length,
+                )
+
+            # out exchange (inverse): send[s] = head block owned by rank s
+            # of this rank's stripe rows; recv[s] = this rank's local heads
+            # of stripe s's rows.
+            send_o = q.new_zeros((dcp, stripe_len, heads, out_dim))
+            if out_stripe is not None:
+                send_o[:, :my_rows] = (
+                    out_stripe.view(my_rows, dcp, heads, out_dim)
+                    .permute(1, 0, 2, 3)
+                )
+            recv_o = torch.empty_like(send_o)
+            dist.all_to_all_single(
+                recv_o, send_o, group=dcp_group.device_group
+            )
+            for s in range(dcp):
+                rows = (
+                    min((s + 1) * stripe_len, num_chunk_tokens)
+                    - s * stripe_len
+                )
+                if rows > 0:
+                    dst = token_start + s * stripe_len
+                    attn_out[dst : dst + rows] = recv_o[s, :rows]
+
+        return attn_out, None
 
     def _forward_fp8_kv_mixed_batch(
         self,

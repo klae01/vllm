@@ -898,6 +898,17 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 )
             else:
                 mqa_q = (mqa_ql_nope, mqa_q_pe)
+            # The impl may manage DCP q/out exchange itself for this batch
+            # (e.g. prefill stripes need only a 1/dcp-volume all-to-all and
+            # complete outputs): skip the whole-batch head allgather and the
+            # LSE combine below when it does.
+            dcp_self_comm = (
+                self.impl.dcp_world_size > 1
+                and not self.use_pcp
+                and not self.dcp_a2a
+                and getattr(self.impl, "dcp_self_managed_comm", None) is not None
+                and self.impl.dcp_self_managed_comm(attn_metadata)
+            )
             # concatenate nope + pe -> (B, N, L + P) (fp8 op above may have fused)
             if self.impl.dcp_world_size > 1:
                 if self.use_pcp:
@@ -909,7 +920,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     if isinstance(mqa_q, tuple):
                         # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
                         mqa_q = torch.cat(mqa_q, dim=-1)
-                    if not qrep_decode:
+                    if not qrep_decode and not dcp_self_comm:
                         # mqa_q do allgather in head dim.
                         mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
 
@@ -919,7 +930,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)  # type: ignore[attr-defined]
 
             # correct dcp attn_out with lse.
-            if self.impl.dcp_world_size > 1:
+            # (skipped when the impl already returned combined local-head
+            # output via its self-managed DCP exchange)
+            if self.impl.dcp_world_size > 1 and not dcp_self_comm:
                 assert lse is not None
                 if self.dcp_a2a:
                     attn_out = dcp_a2a_lse_reduce(
