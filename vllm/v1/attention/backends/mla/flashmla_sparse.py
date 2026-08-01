@@ -27,6 +27,7 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
+    triton_convert_req_index_to_dcp_gathered_ws_index,
     triton_convert_req_index_to_global_index,
     triton_filter_and_convert_dcp_index,
 )
@@ -205,8 +206,15 @@ class FlashMLASparseMetadata(AttentionMetadata):
                 req_start_idx: int
                 workspace_starts: torch.Tensor
                 chunk_tot_seqlen: int
+                # DCP fast path: this rank's slice of the chunk's query tokens
+                # (absolute token indices within the batch).
+                stripe_slice: slice | None = None
 
             chunks: list[Chunk]
+            # DCP fast path: workspace_starts/chunk_tot_seqlen are padded
+            # per-rank shard row counts and each rank computes only its
+            # stripe of query tokens over the DCP-allgathered workspace.
+            dcp_fast: bool = False
 
         num_prefills: int = 0
         num_decodes: int = 0
@@ -273,6 +281,20 @@ class FlashMLASparseMetadataBuilder(
         )
 
         self.use_fp8_kv_cache = cache_config.cache_dtype == "fp8_ds_mla"
+        # DCP prefill fast path: each rank attends its stripe of prefill query
+        # tokens (with DCP-gathered heads) over the full context assembled by
+        # a per-layer workspace allgather; complete stripe outputs are routed
+        # through the exact LSE combine via -inf LSE on non-owned rows. Only
+        # wired for the ag_rs combine; PCP changes the q-gather semantics.
+        self.dcp_rank = 0
+        self._dcp_prefill_fast_ok = False
+        if self.dcp_world_size > 1:
+            from vllm.distributed.parallel_state import get_dcp_group
+
+            self.dcp_rank = get_dcp_group().rank_in_group
+            self._dcp_prefill_fast_ok = (
+                parallel_config.dcp_comm_backend == "ag_rs" and not self.use_pcp
+            )
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         # Shape: [max_num_seqs], all elements = topk_tokens (constant for full-CG)
         self.topk_tokens_tensor = torch.full(
@@ -355,6 +377,7 @@ class FlashMLASparseMetadataBuilder(
         self,
         common_attn_metadata: CommonAttentionMetadata,
         metadata: FlashMLASparseMetadata,
+        dcp_fast: bool = False,
     ) -> "FlashMLASparseMetadata.FP8SeparatePrefillDecode":
         num_tokens = common_attn_metadata.num_actual_tokens
 
@@ -398,6 +421,18 @@ class FlashMLASparseMetadataBuilder(
             query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
 
             prefill_seq_lens_cpu = seq_lens_cpu[num_decodes:]
+            if dcp_fast:
+                # Workspace rows are per-rank shard counts, padded so every
+                # rank's compact segment uses identical per-request offsets
+                # (required for the symmetric allgather layout).
+                stride = self.dcp_world_size * self.cp_kv_cache_interleave_size
+                prefill_ws_lens_cpu = (
+                    (prefill_seq_lens_cpu + stride - 1)
+                    // stride
+                    * self.cp_kv_cache_interleave_size
+                ).to(torch.int32)
+            else:
+                prefill_ws_lens_cpu = prefill_seq_lens_cpu
 
             # Build prefill_request_id: -1 for decode, request index for
             # prefill. This enables a single
@@ -418,7 +453,7 @@ class FlashMLASparseMetadataBuilder(
                 num_prefills, dtype=torch.int32, pin_memory=True
             )
             prefill_workspace_starts_cpu[1:] = torch.cumsum(
-                prefill_seq_lens_cpu[:-1], dim=0
+                prefill_ws_lens_cpu[:-1], dim=0
             )
             # populated by non-blocking copy after prefill_workspace_starts_cpu is
             # updated by each chunk
@@ -430,8 +465,14 @@ class FlashMLASparseMetadataBuilder(
             max_prefill_buffer_size = get_prefill_workspace_size(
                 self.vllm_config.model_config.max_model_len
             )
+            if dcp_fast:
+                # Workspace lens are per-rank shard counts and the attention
+                # runs over a dcp_world_size x larger allgathered tensor; cap
+                # the padded chunk rows so the gathered tensor stays within
+                # the same byte envelope as the non-DCP workspace.
+                max_prefill_buffer_size //= self.dcp_world_size
             chunk_bounds = split_prefill_chunks(
-                prefill_seq_lens_cpu, max_prefill_buffer_size
+                prefill_ws_lens_cpu, max_prefill_buffer_size
             )
 
             prefill_chunks = []
@@ -445,10 +486,20 @@ class FlashMLASparseMetadataBuilder(
                 offset = prefill_workspace_starts_cpu[chunk_start].item()
                 prefill_workspace_starts_cpu[chunk_start:chunk_end] -= offset
 
-                chunk_tot_seqlen = prefill_seq_lens_cpu[chunk_start:chunk_end].sum()
+                chunk_tot_seqlen = prefill_ws_lens_cpu[chunk_start:chunk_end].sum()
                 token_start = query_start_loc_cpu[num_decodes + chunk_start].item()
                 token_end = query_start_loc_cpu[num_decodes + chunk_end].item()
                 tokens_slice = slice(token_start, token_end)
+
+                stripe_slice = None
+                if dcp_fast:
+                    # Split the chunk's query tokens evenly across DCP ranks;
+                    # this rank computes only its stripe.
+                    num_chunk_tokens = token_end - token_start
+                    stripe = -(-num_chunk_tokens // self.dcp_world_size)
+                    s_start = min(token_start + self.dcp_rank * stripe, token_end)
+                    s_end = min(s_start + stripe, token_end)
+                    stripe_slice = slice(s_start, s_end)
 
                 # Create chunk view of gpu tensor
                 chunk_workspace_starts = prefill_workspace_starts[chunk_start:chunk_end]
@@ -463,6 +514,7 @@ class FlashMLASparseMetadataBuilder(
                         req_start_idx=chunk_start,
                         workspace_starts=chunk_workspace_starts,
                         chunk_tot_seqlen=chunk_tot_seqlen,
+                        stripe_slice=stripe_slice,
                     )
                 )
 
@@ -474,6 +526,7 @@ class FlashMLASparseMetadataBuilder(
                 request_ids=prefill_request_id,
                 workspace_starts=prefill_workspace_starts,
                 chunks=prefill_chunks,
+                dcp_fast=dcp_fast,
             )
 
         if num_decodes > 0:
@@ -501,7 +554,20 @@ class FlashMLASparseMetadataBuilder(
     ) -> FlashMLASparseMetadata:
         metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
 
-        fp8_use_mixed_batch = self.num_heads < MIN_HEADS_FOR_BF16_PREFILL
+        # Under DCP, batches with prefill tokens take the separate path with the
+        # DCP fast prefill (workspace allgather + per-rank token stripes); the
+        # mixed batch path would run every prefill token on every rank against
+        # its 1/dcp KV shard with shard-filtered top-k (dcp x redundant, badly
+        # shaped rows). Decode-only batches keep the mixed path so captured
+        # decode CUDA graphs are unchanged.
+        dcp_prefill_fast = (
+            self._dcp_prefill_fast_ok
+            and self.use_fp8_kv_cache
+            and metadata.num_prefills > 0
+        )
+        fp8_use_mixed_batch = (
+            self.num_heads < MIN_HEADS_FOR_BF16_PREFILL and not dcp_prefill_fast
+        )
         metadata.fp8_use_mixed_batch = fp8_use_mixed_batch
         if self.use_fp8_kv_cache:
             if fp8_use_mixed_batch:
@@ -510,7 +576,7 @@ class FlashMLASparseMetadataBuilder(
                 )
             else:
                 metadata.fp8_extra_metadata = self._build_fp8_separate_prefill_decode(
-                    common_attn_metadata, metadata
+                    common_attn_metadata, metadata, dcp_fast=dcp_prefill_fast
                 )
 
         return metadata
@@ -694,32 +760,40 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         # For BF16 cache: always use global cache slots (no workspace)
         # prefill_workspace_starts has been adjusted in-place per chunk so
         # prefill indices automatically come out chunk-local
-        if self.dcp_world_size > 1:
-            # Decode-context-parallel: each rank holds a disjoint KV shard, so
-            # the globally-consistent top-k indices are filtered to this rank's
-            # owned slots before the decode kernel. Every rank attends only to
-            # its shard and the partial outputs are merged by the LSE-weighted
-            # combine in the MLA common forward. The prefill workspace gather
-            # is not shard-local, so a mixed DCP batch cannot take this path.
-            if has_prefill_workspace:
+        dcp_fast = self.dcp_world_size > 1 and has_prefill_workspace
+        if dcp_fast:
+            assert fp8_metadata.prefill is not None
+            if not fp8_metadata.prefill.dcp_fast:
                 raise NotImplementedError(
-                    "FlashMLA sparse decode-context-parallel does not support "
-                    "prefill tokens in the separate prefill/decode path; "
-                    "prefill under DCP must use the mixed-batch path."
+                    "FlashMLA sparse DCP prefill is only supported with the "
+                    "ag_rs dcp_comm_backend and without prefill context "
+                    "parallelism (the DCP fast-path metadata was not built)."
                 )
-            topk_indices, topk_length = triton_filter_and_convert_dcp_index(
-                attn_metadata.req_id_per_token[: topk_indices.shape[0]],
-                attn_metadata.block_table,
-                topk_indices,
-                dcp_size=self.dcp_world_size,
-                dcp_rank=self.dcp_rank,
-                cp_kv_cache_interleave_size=(
-                    attn_metadata.cp_kv_cache_interleave_size
-                ),
-                BLOCK_SIZE=attn_metadata.block_size,
-                NUM_TOPK_TOKENS=topk_indices.shape[1],
-                return_valid_counts=True,
-            )
+
+        raw_topk_indices = topk_indices
+        topk_length: torch.Tensor | None = None
+        if self.dcp_world_size > 1:
+            # Decode-context-parallel: decode rows attend this rank's KV shard
+            # (globally-consistent top-k filtered to owned slots; the partial
+            # outputs are merged by the LSE-weighted combine in the MLA common
+            # forward). Prefill rows take the DCP fast path: their raw
+            # req-local indices are converted per chunk to offsets in the
+            # DCP-allgathered workspace below.
+            topk_indices = raw_topk_indices[:num_decode_tokens]
+            if num_decode_tokens > 0:
+                topk_indices, topk_length = triton_filter_and_convert_dcp_index(
+                    attn_metadata.req_id_per_token[:num_decode_tokens],
+                    attn_metadata.block_table,
+                    topk_indices,
+                    dcp_size=self.dcp_world_size,
+                    dcp_rank=self.dcp_rank,
+                    cp_kv_cache_interleave_size=(
+                        attn_metadata.cp_kv_cache_interleave_size
+                    ),
+                    BLOCK_SIZE=attn_metadata.block_size,
+                    NUM_TOPK_TOKENS=topk_indices.shape[1],
+                    return_valid_counts=True,
+                )
         else:
             topk_indices, topk_length = triton_convert_req_index_to_global_index(
                 attn_metadata.req_id_per_token[: topk_indices.shape[0]],
@@ -760,9 +834,10 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             lse = self._normalize_lse(lse, attn_out.shape[0], attn_out.shape[1])
             return attn_out, lse
 
-        # LSE is only meaningful for the decode rows (the DCP combine runs on
-        # decode; prefill in this path is rejected under DCP above). Decode
-        # rows are always the prefix [:num_decode_tokens] of the batch.
+        # Decode rows are always the prefix [:num_decode_tokens] of the batch.
+        # Under DCP the full-batch LSE is assembled below (decode rows carry
+        # the real kernel LSE; prefill stripe rows are complete so they route
+        # through the combine with weight one via the -inf trick).
         decode_lse: torch.Tensor | None = None
 
         # Pure decode: direct call without allocation
@@ -770,9 +845,11 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             assert fp8_metadata.decode is not None
             attn_out, decode_lse = _fp8_decode(q, topk_indices)
         else:
-            # Mixed or pure prefill: allocate output tensor
+            # Mixed or pure prefill: allocate output tensor. Use the runtime
+            # head count: under DCP the query heads arrive all-gathered
+            # (H = num_heads * dcp_world_size).
             attn_out = q.new_empty(
-                (num_mqa_tokens, self.num_heads, self.kv_lora_rank),
+                (num_mqa_tokens, q.shape[1], self.kv_lora_rank),
                 dtype=q.dtype,
                 device=q.device,
             )
@@ -785,26 +862,93 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                 attn_out[:num_decode_tokens] = decode_out
 
             assert fp8_metadata.prefill is not None
+            prefill_meta = fp8_metadata.prefill
+            if dcp_fast:
+                from vllm.distributed.parallel_state import get_dcp_group
+
+                logger.info_once(
+                    "FlashMLA sparse: DCP prefill fast path active "
+                    "(workspace allgather + per-rank query stripes)"
+                )
+                # Rows outside this rank's stripes must contribute exactly
+                # zero through the DCP combine (their LSE stays -inf).
+                attn_out[num_decode_tokens:] = 0
+                for chunk in prefill_meta.chunks:
+                    tot = int(chunk.chunk_tot_seqlen)
+                    local_ws = self.prefill_bf16_workspace[:tot]
+                    ops.cp_gather_and_upconvert_fp8_kv_cache(
+                        kv_c_and_k_pe_cache,
+                        local_ws,
+                        chunk.block_table,
+                        chunk.workspace_starts,
+                        len(chunk.block_table),
+                    )
+                    # Collective: every DCP rank contributes the same padded
+                    # row count, even when its query stripe is empty.
+                    gathered_ws = get_dcp_group().all_gather(local_ws, dim=0)
+
+                    stripe = chunk.stripe_slice
+                    assert stripe is not None
+                    if stripe.stop <= stripe.start:
+                        continue
+                    ws_indices, ws_topk_length = (
+                        triton_convert_req_index_to_dcp_gathered_ws_index(
+                            prefill_meta.request_ids[stripe],
+                            raw_topk_indices[stripe],
+                            prefill_meta.workspace_starts,
+                            per_rank_rows=tot,
+                            dcp_size=self.dcp_world_size,
+                            cp_kv_cache_interleave_size=(
+                                attn_metadata.cp_kv_cache_interleave_size
+                            ),
+                        )
+                    )
+                    attn_out[stripe] = self._bf16_flash_mla_kernel(
+                        q[stripe],
+                        gathered_ws,
+                        ws_indices,
+                        ws_topk_length,
+                    )
+            else:
+                assert topk_length is not None
+                for chunk in prefill_meta.chunks:
+                    chunk_workspace = self.prefill_bf16_workspace[
+                        : chunk.chunk_tot_seqlen
+                    ]
+                    ops.cp_gather_and_upconvert_fp8_kv_cache(
+                        kv_c_and_k_pe_cache,
+                        chunk_workspace,
+                        chunk.block_table,
+                        chunk.workspace_starts,
+                        len(chunk.block_table),
+                    )
+
+                    chunk_q = q[chunk.tokens_slice]
+                    chunk_topk_indices_workspace = topk_indices[chunk.tokens_slice]
+                    chunk_topk_length = topk_length[chunk.tokens_slice]
+
+                    attn_out[chunk.tokens_slice] = self._bf16_flash_mla_kernel(
+                        chunk_q,
+                        chunk_workspace,
+                        chunk_topk_indices_workspace,
+                        chunk_topk_length,
+                    )
+
+        if dcp_fast:
+            # Full-batch LSE for the DCP combine: real LSE on decode rows,
+            # 0 on this rank's complete prefill stripe rows, -inf elsewhere
+            # (the combine kernel maps -inf to weight zero).
+            lse = q.new_full(
+                (num_mqa_tokens, q.shape[1]), float("-inf"), dtype=torch.float32
+            )
+            if decode_lse is not None:
+                lse[:num_decode_tokens] = decode_lse
+            assert fp8_metadata.prefill is not None
             for chunk in fp8_metadata.prefill.chunks:
-                chunk_workspace = self.prefill_bf16_workspace[: chunk.chunk_tot_seqlen]
-                ops.cp_gather_and_upconvert_fp8_kv_cache(
-                    kv_c_and_k_pe_cache,
-                    chunk_workspace,
-                    chunk.block_table,
-                    chunk.workspace_starts,
-                    len(chunk.block_table),
-                )
-
-                chunk_q = q[chunk.tokens_slice]
-                chunk_topk_indices_workspace = topk_indices[chunk.tokens_slice]
-                chunk_topk_length = topk_length[chunk.tokens_slice]
-
-                attn_out[chunk.tokens_slice] = self._bf16_flash_mla_kernel(
-                    chunk_q,
-                    chunk_workspace,
-                    chunk_topk_indices_workspace,
-                    chunk_topk_length,
-                )
+                stripe = chunk.stripe_slice
+                if stripe is not None and stripe.stop > stripe.start:
+                    lse[stripe] = 0.0
+            return attn_out, lse
 
         return attn_out, decode_lse
 
@@ -939,20 +1083,23 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         topk_length: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
+        # Runtime head count: under the DCP fast path the query heads arrive
+        # all-gathered (H = num_heads * dcp_world_size); otherwise per-rank.
+        num_q_heads = q.shape[1]
         kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(
             -1, 1, kv_c_and_k_pe_cache.shape[-1]
         )
 
         # NOTE(Chen): kernel requires num_local_head to be a multiple of
         # 64 on hopper and 128 on blackwell
-        if self.num_heads % self.prefill_padding != 0:
-            assert self.prefill_padding % self.num_heads == 0
+        if num_q_heads % self.prefill_padding != 0:
+            assert self.prefill_padding % num_q_heads == 0
             logger.warning_once(
-                f"Padding num_heads from {self.num_heads} to "
+                f"Padding num_heads from {num_q_heads} to "
                 f"{self.prefill_padding} for BF16 sparse prefill kernel"
             )
             q_padded = q.new_empty((q.shape[0], self.prefill_padding, q.shape[2]))
-            q_padded[:, : self.num_heads, :] = q
+            q_padded[:, :num_q_heads, :] = q
             q = q_padded
 
         topk_indices = topk_indices.view(num_tokens, 1, -1)
@@ -964,7 +1111,7 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             topk_length=topk_length,
         )[0]
 
-        output = output[:, : self.num_heads, :]
+        output = output[:, :num_q_heads, :]
         return output
 
     def forward_mqa(

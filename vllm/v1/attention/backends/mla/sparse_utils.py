@@ -236,6 +236,99 @@ def triton_convert_req_index_to_global_index(
     return out
 
 
+@triton.jit
+def _convert_req_index_to_dcp_gathered_ws_index_kernel(
+    prefill_req_id_ptr,  # int32 [num_tokens] chunk-relative prefill request idx
+    token_indices_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS] req-local positions
+    ws_starts_ptr,  # int32 [num_chunk_reqs] padded per-request starts
+    out_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS] gathered-workspace offsets
+    valid_count_ptr,  # int32 [num_tokens]
+    per_rank_rows,  # rows contributed by each rank to the allgather
+    BLOCK_N: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_INTERLEAVE: tl.constexpr,
+    ti_stride0,
+    ti_stride1,
+    out_stride0,
+    out_stride1,
+):
+    """Map req-local token positions to offsets in the DCP-allgathered workspace.
+
+    The workspace is laid out rank-major: rank r's compact shard occupies rows
+    [r * per_rank_rows, (r + 1) * per_rank_rows), and within it request j's
+    rows start at ws_starts[j] (padded so every rank uses identical starts).
+    Every top-k entry stays valid (no shard filtering) -- only the indexer's
+    -1 sentinels map to -1.
+    """
+    token_id = tl.program_id(0)
+    tile_id = tl.program_id(1)
+    indice_id = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    req = tl.load(prefill_req_id_ptr + token_id)
+    ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
+    tok = tl.load(ti_ptr)
+    is_invalid = tok < 0
+
+    owning_rank = (tok // DCP_INTERLEAVE) % DCP_SIZE
+    local_idx = (
+        tok // (DCP_SIZE * DCP_INTERLEAVE)
+    ) * DCP_INTERLEAVE + tok % DCP_INTERLEAVE
+
+    ws_start = tl.load(ws_starts_ptr + req)
+    out_val = owning_rank * per_rank_rows + ws_start + local_idx
+    out_val = tl.where(is_invalid, -1, out_val)
+
+    out_ptr_ij = out_ptr + token_id * out_stride0 + indice_id * out_stride1
+    tl.store(out_ptr_ij, out_val)
+    tile_valid = tl.sum((~is_invalid).to(tl.int32))
+    tl.atomic_add(valid_count_ptr + token_id, tile_valid)
+
+
+def triton_convert_req_index_to_dcp_gathered_ws_index(
+    prefill_req_id: torch.Tensor,  # int32 [num_tokens], chunk-relative req idx
+    token_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS]
+    ws_starts: torch.Tensor,  # int32 [num_chunk_reqs], padded starts
+    per_rank_rows: int,
+    dcp_size: int,
+    cp_kv_cache_interleave_size: int = 1,
+    BLOCK_N: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert top-k positions for prefill tokens to DCP-gathered workspace
+    offsets, returning (offsets, valid_counts). See kernel docstring."""
+    assert prefill_req_id.dtype == torch.int32
+    assert token_indices.dtype == torch.int32
+    assert ws_starts.dtype == torch.int32
+    assert prefill_req_id.shape[0] == token_indices.shape[0]
+    num_topk = token_indices.shape[1]
+    assert num_topk % BLOCK_N == 0
+
+    num_tokens = prefill_req_id.shape[0]
+    ti = token_indices.contiguous()
+    out = torch.empty_like(ti)
+    valid_counts = torch.zeros(num_tokens, dtype=torch.int32, device=ti.device)
+    if num_tokens == 0:
+        return out, valid_counts
+
+    _convert_req_index_to_dcp_gathered_ws_index_kernel[
+        (num_tokens, num_topk // BLOCK_N)
+    ](
+        prefill_req_id.contiguous(),
+        ti,
+        ws_starts.contiguous(),
+        out,
+        valid_counts,
+        per_rank_rows,
+        BLOCK_N,
+        dcp_size,
+        cp_kv_cache_interleave_size,
+        ti.stride(0),
+        ti.stride(1),
+        out.stride(0),
+        out.stride(1),
+    )
+    return out, valid_counts
+
+
 def triton_filter_and_convert_dcp_index(
     req_id: torch.Tensor,
     block_table: torch.Tensor,
