@@ -1244,11 +1244,8 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                 outs.append(o)
                 lses.append(l)
             _attn_out = torch.cat(outs, dim=1)
-            # LSE layout is build-dependent ((1, H, s) or (1, s, H)); find the
-            # token axis from the first slice, whose length (FP8_DECODE_MAX_SQ)
-            # cannot collide with the head count.
-            token_axis = -1 if lses[0].shape[-1] == FP8_DECODE_MAX_SQ else -2
-            _lse = torch.cat(lses, dim=token_axis)
+            # FlashMLA LSE is (batch, num_heads_q, seq_len_q): token axis last.
+            _lse = torch.cat(lses, dim=-1)
         else:
             _attn_out, _lse = self._fp8_flash_mla_kernel(
                 q=q.unsqueeze(0),  # add batch_dim: (T, H, D) -> (1, T, H, D)
@@ -1309,17 +1306,17 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         )
 
         # Slice output back to actual head count if we padded. The kernel emits
-        # LSE with the padded head count too, so slice it on the head axis as
-        # well; otherwise the extra padded-head LSE entries corrupt the
-        # downstream normalization and the DCP LSE-weighted combine.
+        # LSE with the padded head count too — always (batch, num_heads_q,
+        # seq_len_q) per the FlashMLA interface — so slice the head axis
+        # explicitly. Size-based axis guessing is unsafe here: it picked the
+        # token axis whenever seq_len_q == padded_num_heads.
         if actual_num_heads < padded_num_heads:
             out = out[:, :, :actual_num_heads, :]
-            if lse.shape[-1] == padded_num_heads:
-                # LSE laid out (..., H): heads on the last axis.
-                lse = lse[..., :actual_num_heads]
-            elif lse.dim() >= 2 and lse.shape[-2] == padded_num_heads:
-                # LSE laid out (..., H, 1) or (..., H, X): heads on axis -2.
-                lse = lse[..., :actual_num_heads, :]
+            assert lse.shape[-2:] == (padded_num_heads, q.size(1)), (
+                f"expected LSE (batch, heads={padded_num_heads}, "
+                f"seq={q.size(1)}), got {tuple(lse.shape)}"
+            )
+            lse = lse[..., :actual_num_heads, :]
 
         return out, lse
 
