@@ -148,6 +148,13 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
             quant_config.gemm1_beta if quant_config.gemm1_beta is not None else 0.0
         )
 
+    @property
+    def expects_unquantized_inputs(self) -> bool:
+        # FP8-block input quant is fused into the permute scatter
+        # (deepgemm_moe_permute with aq_scale=None); MXFP8 still needs the
+        # standalone quant for its uint8 UE8M0 scales.
+        return not self.mxfp8
+
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.Standard
@@ -302,7 +309,10 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ):
-        assert a1q_scale is not None
+        # a1q_scale None => prepare deferred input quant
+        # (expects_unquantized_inputs); the scatter fuses it. MXFP8 always
+        # arrives pre-quantized.
+        assert a1q_scale is not None or not self.mxfp8
         assert a2_scale is None
         assert self.block_shape is not None
         assert self.w1_scale is not None

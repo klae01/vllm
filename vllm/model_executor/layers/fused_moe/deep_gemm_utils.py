@@ -12,7 +12,10 @@ import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.utils import count_expert_num_tokens
 from vllm.triton_utils import tl, triton
-from vllm.utils.deep_gemm import get_mk_alignment_for_contiguous_layout
+from vllm.utils.deep_gemm import (
+    get_mk_alignment_for_contiguous_layout,
+    is_deep_gemm_e8m0_used,
+)
 from vllm.utils.math_utils import round_up
 
 
@@ -271,6 +274,158 @@ def _fwd_kernel_ep_scatter_2(
                     )
 
 
+@triton.jit
+def _fwd_kernel_ep_scatter_2_quant(
+    total_token_num,
+    expert_start_loc,
+    recv_x,
+    recv_x_stride0,
+    recv_topk,
+    recv_topk_stride0,
+    recv_topk_stride1,
+    output_tensor,
+    output_tensor_stride0,
+    output_tensor_scale,
+    output_tensor_scale_stride0,
+    output_tensor_scale_stride1,
+    output_index,
+    output_index_stride0,
+    output_index_stride1,
+    eps,
+    topk_num: tl.constexpr,
+    expert_map,
+    HAS_EXPERT_MAP: tl.constexpr,
+    fp8_min: tl.constexpr,
+    fp8_max: tl.constexpr,
+    USE_UE8M0: tl.constexpr,
+    GROUP_K: tl.constexpr,
+    SCALE_HIDDEN_SIZE: tl.constexpr,
+    SCALE_HIDDEN_SIZE_PAD: tl.constexpr,
+):
+    """Scatter variant fusing per-token-group FP8 quantization.
+
+    Reads the unquantized activations once per token, quantizes per
+    GROUP_K-sized group (matching _per_token_group_quant_fp8's math) and
+    writes the FP8 replicas + float32 scales for each expert destination,
+    replacing the standalone quant kernel plus the plain-copy scatter.
+    """
+    start_token_id = tl.program_id(0)
+    grid_num = tl.num_programs(0)
+
+    offs_g = tl.arange(0, SCALE_HIDDEN_SIZE_PAD)
+    offs_k = tl.arange(0, GROUP_K)
+    offs_2d = offs_g[:, None] * GROUP_K + offs_k[None, :]
+    mask_g = offs_g < SCALE_HIDDEN_SIZE
+    mask_2d = mask_g[:, None] & (offs_k[None, :] < GROUP_K)
+
+    output_tensor_stride0 = output_tensor_stride0.to(tl.int64)
+
+    for token_id in range(start_token_id, total_token_num, grid_num):
+        y = tl.load(
+            recv_x + token_id * recv_x_stride0 + offs_2d, mask=mask_2d, other=0.0
+        ).to(tl.float32)
+        _absmax = tl.maximum(tl.max(tl.abs(y), axis=1), eps)
+        scale_raw = _absmax * (1.0 / fp8_max)
+        if USE_UE8M0:
+            y_s = tl.math.exp2(tl.ceil(tl.log2(scale_raw)))
+        else:
+            y_s = scale_raw
+        y_q = tl.clamp(y / y_s[:, None], fp8_min, fp8_max).to(
+            output_tensor.dtype.element_ty
+        )
+
+        for topk_index in tl.range(0, topk_num, 1, num_stages=4):
+            expert_id = tl.load(recv_topk + token_id * recv_topk_stride0 + topk_index)
+
+            if HAS_EXPERT_MAP:
+                expert_id = apply_expert_map(expert_id, expert_map)
+
+            if expert_id >= 0:
+                dest_token_index = tl.atomic_add(expert_start_loc + expert_id, 1)
+                dest_token_index_i64 = dest_token_index.to(tl.int64)
+                tl.store(
+                    output_index + token_id * output_index_stride0 + topk_index,
+                    dest_token_index,
+                )
+                output_tensor_ptr = (
+                    output_tensor + dest_token_index_i64 * output_tensor_stride0
+                )
+                tl.store(output_tensor_ptr + offs_2d, y_q, mask=mask_2d)
+                tl.store(
+                    output_tensor_scale
+                    + dest_token_index * output_tensor_scale_stride0
+                    + offs_g * output_tensor_scale_stride1,
+                    y_s,
+                    mask=mask_g,
+                )
+
+
+@torch.no_grad()
+def ep_scatter_quant(
+    recv_x: torch.Tensor,
+    recv_topk: torch.Tensor,
+    num_recv_tokens_per_expert: torch.Tensor,
+    expert_map: torch.Tensor | None,
+    expert_start_loc: torch.Tensor,
+    output_tensor: torch.Tensor,
+    output_tensor_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    output_index: torch.Tensor,
+    align_m: int,
+    group_k: int,
+    eps: float,
+    fp8_min: float,
+    fp8_max: float,
+    use_ue8m0: bool,
+):
+    num_experts = num_recv_tokens_per_expert.shape[0]
+    hidden_size = recv_x.shape[1]
+    assert hidden_size % group_k == 0
+    assert recv_x.stride(1) == 1
+    scale_hidden_size = hidden_size // group_k
+
+    _fwd_kernel_ep_scatter_1[(num_experts,)](
+        num_recv_tokens_per_expert,
+        expert_start_loc,
+        m_indices,
+        num_experts=num_experts,
+        num_warps=8,
+        BLOCK_E=128,
+        BLOCK_EXPERT_NUM=triton.next_power_of_2(num_experts),
+        ALIGN_M=align_m,
+    )
+
+    grid = min(recv_topk.shape[0], 1024 * 8)
+    _fwd_kernel_ep_scatter_2_quant[(grid,)](
+        recv_topk.shape[0],
+        expert_start_loc,
+        recv_x,
+        recv_x.stride(0),
+        recv_topk,
+        recv_topk.stride(0),
+        recv_topk.stride(1),
+        output_tensor,
+        output_tensor.stride(0),
+        output_tensor_scale,
+        output_tensor_scale.stride(0),
+        output_tensor_scale.stride(1),
+        output_index,
+        output_index.stride(0),
+        output_index.stride(1),
+        eps,
+        topk_num=recv_topk.shape[1],
+        expert_map=expert_map,
+        HAS_EXPERT_MAP=expert_map is not None,
+        num_warps=8,
+        fp8_min=fp8_min,
+        fp8_max=fp8_max,
+        USE_UE8M0=use_ue8m0,
+        GROUP_K=group_k,
+        SCALE_HIDDEN_SIZE=scale_hidden_size,
+        SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(scale_hidden_size),
+    )
+
+
 @torch.no_grad()
 def ep_scatter(
     recv_x: torch.Tensor,
@@ -458,7 +613,7 @@ def ep_gather(
 
 def deepgemm_moe_permute(
     aq: torch.Tensor,
-    aq_scale: torch.Tensor,
+    aq_scale: torch.Tensor | None,
     topk_ids: torch.Tensor,
     local_num_experts: int,
     expert_map: torch.Tensor | None,
@@ -466,8 +621,15 @@ def deepgemm_moe_permute(
     aq_out: torch.Tensor | None = None,
     block_size: int | None = None,
 ):
+    """Permute activations into DeepGEMM's expert-contiguous layout.
+
+    When aq_scale is None, aq is unquantized (bf16/fp16) and per-token-group
+    FP8 quantization is fused into the scatter, eliminating the standalone
+    quant pass over the activations.
+    """
     assert aq.ndim == 2
     assert topk_ids.dtype.is_signed, "The kernel uses -1 to represent invalid topk_ids"
+    quant_input = aq_scale is None
     H = aq.size(1)
     device = aq.device
 
@@ -491,11 +653,12 @@ def deepgemm_moe_permute(
 
     assert aq_out is None or aq_out.shape == (M_sum, H)
     if aq_out is None:
-        aq_out = torch.empty((M_sum, H), device=device, dtype=aq.dtype)
+        out_dtype = torch.float8_e4m3fn if quant_input else aq.dtype
+        aq_out = torch.empty((M_sum, H), device=device, dtype=out_dtype)
 
     # uint8 UE8M0 (MXFP8) -> scatter packs into DeepGEMM's int32 MN-major
     # TMA-aligned layout; float32 (FP8/FP4) scattered row-major as-is.
-    pack_ue8m0 = aq_scale.dtype == torch.uint8
+    pack_ue8m0 = aq_scale is not None and aq_scale.dtype == torch.uint8
     sf_k = H // block_k
     if pack_ue8m0:
         packed_sf_k = (sf_k + 3) // 4
@@ -530,21 +693,46 @@ def deepgemm_moe_permute(
             topk_ids, local_num_experts, expert_map
         )
 
-    ep_scatter(
-        recv_x=aq,
-        recv_x_scale=aq_scale,
-        recv_topk=topk_ids,
-        num_recv_tokens_per_expert=expert_num_tokens,
-        expert_start_loc=expert_start_loc,
-        expert_map=expert_map,
-        output_tensor=aq_out,
-        output_tensor_scale=aq_scale_out,
-        m_indices=expert_ids,
-        output_index=inv_perm,
-        align_m=align_used,
-        block_size=block_k,
-        pack_ue8m0=pack_ue8m0,
-    )
+    if quant_input:
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            get_fp8_min_max,
+        )
+
+        assert aq_out.dtype == torch.float8_e4m3fn
+        fp8_min, fp8_max = get_fp8_min_max()
+        ep_scatter_quant(
+            recv_x=aq,
+            recv_topk=topk_ids,
+            num_recv_tokens_per_expert=expert_num_tokens,
+            expert_map=expert_map,
+            expert_start_loc=expert_start_loc,
+            output_tensor=aq_out,
+            output_tensor_scale=aq_scale_out,
+            m_indices=expert_ids,
+            output_index=inv_perm,
+            align_m=align_used,
+            group_k=block_k,
+            eps=1e-10,
+            fp8_min=fp8_min,
+            fp8_max=fp8_max,
+            use_ue8m0=is_deep_gemm_e8m0_used(),
+        )
+    else:
+        ep_scatter(
+            recv_x=aq,
+            recv_x_scale=aq_scale,
+            recv_topk=topk_ids,
+            num_recv_tokens_per_expert=expert_num_tokens,
+            expert_start_loc=expert_start_loc,
+            expert_map=expert_map,
+            output_tensor=aq_out,
+            output_tensor_scale=aq_scale_out,
+            m_indices=expert_ids,
+            output_index=inv_perm,
+            align_m=align_used,
+            block_size=block_k,
+            pack_ue8m0=pack_ue8m0,
+        )
 
     return aq_out, aq_scale_out, expert_ids, inv_perm, align_used
 
